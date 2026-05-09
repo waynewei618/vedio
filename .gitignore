@@ -1,0 +1,13 @@
+output/
+work/
+__pycache__/
+*.py[cod]
+*.mp4
+*.mkv
+*.wav
+*.m4a
+*.mp3
+*.srt
+*.log
+deepseek_api_key.txt
+.env
