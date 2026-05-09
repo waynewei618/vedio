@@ -68,12 +68,29 @@ Python/TTS 环境使用本地 conda 环境：
 常用参数：
 
 ```bash
---translation-batch-size 6
+--translation-batch-size 8
+--translation-workers 3
+--asr-polish-workers 3
+--tts-workers 2
+--tts-devices 0,1
 --speaker 中文女
 --max-chars-per-sec 10
 --max-duration-ratio 1.15
 --deepseek-model deepseek-v4-pro
 ```
+
+速度相关：
+
+- DeepSeek ASR 纠错和翻译会按批次并发调用 API。
+- CosyVoice TTS 会按字幕 chunk 分组并行合成，默认使用 `--tts-devices 0,1`。
+- 如果只有一张 GPU，运行时改成 `--tts-workers 1 --tts-devices 0`。
+- 已生成的英文字幕、ASR 纠错、翻译、TTS 片段都会缓存，失败后可以续跑。
+
+智能处理：
+
+- `--allow-asr` 启用 Whisper 后，程序会先合并英文碎片，再用 DeepSeek 修正 ASR 错词、重复词和断句。
+- 翻译阶段继续使用 DeepSeek，并强制套用全局/局部术语表。
+- 如需跳过英文 ASR 纠错，可加 `--no-asr-polish`。
 
 ## 输出
 
@@ -87,6 +104,7 @@ output/<BV>/
   <BV>.zh.wav
   <BV>.zh.mkv
   glossary.json
+  asr_polish_cache.json
   quality_report.json
   translation_cache.json
 ```

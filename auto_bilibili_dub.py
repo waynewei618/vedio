@@ -9,6 +9,7 @@ fall back to local Whisper transcription when no English subtitle is available.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -39,6 +40,7 @@ DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 TRANSLATION_CACHE_VERSION = "deepseek-v1"
+ASR_POLISH_CACHE_VERSION = "deepseek-asr-polish-v1"
 
 
 @dataclass
@@ -228,6 +230,53 @@ def deepseek_translate_batch(
     raise RuntimeError(f"DeepSeek 翻译失败: {last_error}") from last_error
 
 
+def deepseek_polish_english_batch(
+    client: OpenAI,
+    *,
+    model: str,
+    batch: list[dict],
+    reasoning_effort: str,
+    retries: int = 3,
+) -> dict[int, str]:
+    system_prompt = (
+        "You are an expert English transcript editor for educational videos.\n"
+        "Fix ASR errors, repeated words, broken phrases, wrong punctuation, and obvious mistranscriptions.\n"
+        "Preserve the original meaning and timing granularity. Do not summarize. Do not translate.\n"
+        "Keep proper nouns and technical terms in English. If a line is already correct, return it unchanged.\n"
+        "Return JSON only, with this shape: {\"subtitles\":[{\"id\":1,\"text\":\"corrected English\"}]}."
+    )
+    user_prompt = "Correct these ASR subtitle segments:\n" + json.dumps({"subtitles": batch}, ensure_ascii=False)
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=False,
+                reasoning_effort=reasoning_effort,
+                extra_body={"thinking": {"type": "enabled"}},
+            )
+            content = response.choices[0].message.content or ""
+            data = extract_json_object(content)
+            items = data.get("subtitles")
+            if not isinstance(items, list):
+                raise ValueError(f"DeepSeek JSON 缺少 subtitles: {content[:500]}")
+            result: dict[int, str] = {}
+            for item in items:
+                result[int(item["id"])] = " ".join(str(item["text"]).split())
+            missing = {entry["id"] for entry in batch} - set(result)
+            if missing:
+                raise ValueError(f"DeepSeek 返回缺少字幕 id: {sorted(missing)}")
+            return result
+        except Exception as exc:
+            last_error = exc
+            print(f"[asr-polish] DeepSeek batch retry {attempt}/{retries}: {exc}", flush=True)
+    raise RuntimeError(f"DeepSeek ASR 纠错失败: {last_error}") from last_error
+
+
 def subtitle_text(sub: srt.Subtitle) -> str:
     return " ".join(sub.content.replace("\n", " ").split())
 
@@ -310,12 +359,14 @@ def translate_srt(
     deepseek_base_url: str,
     deepseek_reasoning_effort: str,
     batch_size: int,
+    workers: int,
 ) -> list[srt.Subtitle]:
     subs = list(srt.parse(en_srt.read_text(encoding="utf-8")))
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
     glossary, digest = load_glossaries(global_glossary_path, local_glossary_path)
     client = OpenAI(api_key=read_deepseek_api_key(deepseek_key_file), base_url=deepseek_base_url)
 
+    pending_batches: list[list[dict]] = []
     pending: list[dict] = []
     key_by_id: dict[int, str] = {}
     source_by_id: dict[int, str] = {}
@@ -324,18 +375,7 @@ def translate_srt(
     def flush() -> None:
         if not pending:
             return
-        print(f"[translate] DeepSeek batch {pending[0]['id']}-{pending[-1]['id']} / {len(subs)}", flush=True)
-        translated = deepseek_translate_batch(
-            client,
-            model=deepseek_model,
-            batch=pending,
-            glossary=glossary,
-            reasoning_effort=deepseek_reasoning_effort,
-        )
-        for item_id, zh_text in translated.items():
-            key = key_by_id[item_id]
-            cache[key] = apply_glossary(zh_text, source_by_id[item_id], glossary)
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        pending_batches.append(list(pending))
         pending.clear()
 
     for sub in subs:
@@ -357,6 +397,27 @@ def translate_srt(
         if len(pending) >= batch_size:
             flush()
     flush()
+
+    def run_batch(batch: list[dict]) -> tuple[list[dict], dict[int, str]]:
+        print(f"[translate] DeepSeek batch {batch[0]['id']}-{batch[-1]['id']} / {len(subs)}", flush=True)
+        return batch, deepseek_translate_batch(
+            client,
+            model=deepseek_model,
+            batch=batch,
+            glossary=glossary,
+            reasoning_effort=deepseek_reasoning_effort,
+        )
+
+    if pending_batches:
+        max_workers = max(1, min(workers, len(pending_batches)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_batch, batch) for batch in pending_batches]
+            for future in concurrent.futures.as_completed(futures):
+                batch, translated = future.result()
+                for item_id, zh_text in translated.items():
+                    key = key_by_id[item_id]
+                    cache[key] = apply_glossary(zh_text, source_by_id[item_id], glossary)
+                cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
     for sub in subs:
         text = original_text_by_id[sub.index]
@@ -450,6 +511,86 @@ def smooth_source_subtitles(
             flush()
     flush()
     return smoothed
+
+
+def polish_source_subtitles(
+    subs: list[srt.Subtitle],
+    cache_path: Path,
+    *,
+    deepseek_model: str,
+    deepseek_key_file: Path,
+    deepseek_base_url: str,
+    deepseek_reasoning_effort: str,
+    batch_size: int,
+    workers: int,
+    force: bool,
+) -> list[srt.Subtitle]:
+    if force:
+        cache: dict[str, str] = {}
+    else:
+        cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    client = OpenAI(api_key=read_deepseek_api_key(deepseek_key_file), base_url=deepseek_base_url)
+
+    pending_batches: list[list[dict]] = []
+    pending: list[dict] = []
+    key_by_id: dict[int, str] = {}
+    original_text_by_id = {sub.index: subtitle_text(sub) for sub in subs}
+
+    def cache_key(text: str) -> str:
+        return f"{ASR_POLISH_CACHE_VERSION}:{deepseek_model}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}:{text}"
+
+    def flush() -> None:
+        if pending:
+            pending_batches.append(list(pending))
+            pending.clear()
+
+    for sub in subs:
+        text = original_text_by_id[sub.index]
+        if not text:
+            continue
+        key = cache_key(text)
+        if key in cache:
+            continue
+        key_by_id[sub.index] = key
+        pending.append(
+            {
+                "id": sub.index,
+                "start": str(sub.start),
+                "end": str(sub.end),
+                "text": text,
+            }
+        )
+        if len(pending) >= batch_size:
+            flush()
+    flush()
+
+    def run_batch(batch: list[dict]) -> tuple[list[dict], dict[int, str]]:
+        print(f"[asr-polish] DeepSeek batch {batch[0]['id']}-{batch[-1]['id']} / {len(subs)}", flush=True)
+        return batch, deepseek_polish_english_batch(
+            client,
+            model=deepseek_model,
+            batch=batch,
+            reasoning_effort=deepseek_reasoning_effort,
+        )
+
+    if pending_batches:
+        max_workers = max(1, min(workers, len(pending_batches)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_batch, batch) for batch in pending_batches]
+            for future in concurrent.futures.as_completed(futures):
+                _batch, corrected = future.result()
+                for item_id, text in corrected.items():
+                    cache[key_by_id[item_id]] = text
+                cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    polished: list[srt.Subtitle] = []
+    for sub in subs:
+        text = original_text_by_id[sub.index]
+        if text:
+            sub.content = cache.get(cache_key(text), text)
+        sub.index = len(polished) + 1
+        polished.append(sub)
+    return polished
 
 
 def make_chunks(subs: list[srt.Subtitle], *, min_seconds: float, max_seconds: float, max_chars: int) -> list[DubChunk]:
@@ -562,6 +703,25 @@ def synthesize_cosyvoice(cosyvoice, text: str, speaker: str, out_wav: Path, spee
     sf.write(out_wav, wav, cosyvoice.sample_rate)
 
 
+def synthesize_chunk_group_worker(payload: dict) -> list[str]:
+    device = payload["device"]
+    if device:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    cosyvoice = load_cosyvoice(Path(payload["model_dir"]), fp16=payload["fp16"])
+    speaker = payload["speaker"]
+    if speaker not in cosyvoice.list_available_spks():
+        raise RuntimeError(f"CosyVoice 没有音色 {speaker!r}; 可用: {', '.join(cosyvoice.list_available_spks())}")
+    written: list[str] = []
+    for item in payload["chunks"]:
+        out_wav = Path(item["raw"])
+        if payload["force"]:
+            out_wav.unlink(missing_ok=True)
+        print(f"[tts:{device}] raw chunk {item['index']} slot={item['slot']:.2f}s", flush=True)
+        synthesize_cosyvoice(cosyvoice, item["text"], speaker, out_wav, speed=payload["tts_speed"])
+        written.append(str(out_wav))
+    return written
+
+
 def make_dub_audio(
     subs: list[srt.Subtitle],
     out_dir: Path,
@@ -573,6 +733,8 @@ def make_dub_audio(
     max_duration_ratio: float,
     fp16: bool,
     force: bool,
+    tts_workers: int,
+    tts_devices: list[str],
 ) -> tuple[Path, list[dict]]:
     dub_wav = out_dir / f"{out_dir.name}.zh.wav"
     if dub_wav.exists() and not force:
@@ -581,9 +743,62 @@ def make_dub_audio(
     chunks = make_chunks(subs, min_seconds=8.0, max_seconds=28.0, max_chars=180)
     segment_dir = out_dir / "tts_segments"
     segment_dir.mkdir(exist_ok=True)
-    cosyvoice = load_cosyvoice(model_dir, fp16=fp16)
-    if speaker not in cosyvoice.list_available_spks():
-        raise RuntimeError(f"CosyVoice 没有音色 {speaker!r}; 可用: {', '.join(cosyvoice.list_available_spks())}")
+
+    raw_jobs = []
+    for chunk in chunks:
+        raw = segment_dir / f"{chunk.index:04d}_raw.wav"
+        fixed = segment_dir / f"{chunk.index:04d}_fixed.wav"
+        if force:
+            raw.unlink(missing_ok=True)
+            fixed.unlink(missing_ok=True)
+        if not raw.exists() or raw.stat().st_size == 0:
+            raw_jobs.append(
+                {
+                    "index": chunk.index,
+                    "slot": chunk.slot,
+                    "text": chunk.text,
+                    "raw": str(raw),
+                }
+            )
+
+    if raw_jobs:
+        worker_count = max(1, min(tts_workers, len(raw_jobs)))
+        devices = tts_devices or [""]
+        if worker_count <= 1:
+            synthesize_chunk_group_worker(
+                {
+                    "device": devices[0] if devices else "",
+                    "model_dir": str(model_dir),
+                    "fp16": fp16,
+                    "speaker": speaker,
+                    "tts_speed": tts_speed,
+                    "force": force,
+                    "chunks": raw_jobs,
+                }
+            )
+        else:
+            groups = [[] for _ in range(worker_count)]
+            for index, job in enumerate(raw_jobs):
+                groups[index % worker_count].append(job)
+            payloads = []
+            for index, group in enumerate(groups):
+                if not group:
+                    continue
+                payloads.append(
+                    {
+                        "device": devices[index % len(devices)] if devices else "",
+                        "model_dir": str(model_dir),
+                        "fp16": fp16,
+                        "speaker": speaker,
+                        "tts_speed": tts_speed,
+                        "force": force,
+                        "chunks": group,
+                    }
+                )
+            with concurrent.futures.ProcessPoolExecutor(max_workers=len(payloads)) as executor:
+                futures = [executor.submit(synthesize_chunk_group_worker, payload) for payload in payloads]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
 
     concat_file = segment_dir / "concat.txt"
     parts: list[Path] = []
@@ -598,11 +813,7 @@ def make_dub_audio(
 
         raw = segment_dir / f"{chunk.index:04d}_raw.wav"
         fixed = segment_dir / f"{chunk.index:04d}_fixed.wav"
-        if force:
-            raw.unlink(missing_ok=True)
-            fixed.unlink(missing_ok=True)
         print(f"[tts] chunk {chunk.index}/{len(chunks)} slot={chunk.slot:.2f}s", flush=True)
-        synthesize_cosyvoice(cosyvoice, chunk.text, speaker, raw, speed=tts_speed)
         item = convert_audio_to_slot(raw, fixed, chunk.slot, max_duration_ratio=max_duration_ratio)
         item.update({"index": chunk.index, "start": chunk.start, "end": chunk.end, "sub_indexes": chunk.sub_indexes})
         report.append(item)
@@ -737,6 +948,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deepseek-base-url", default=DEFAULT_DEEPSEEK_BASE_URL)
     parser.add_argument("--deepseek-reasoning-effort", default="high")
     parser.add_argument("--translation-batch-size", type=int, default=8)
+    parser.add_argument("--translation-workers", type=int, default=3)
+    parser.add_argument("--no-asr-polish", action="store_true", help="跳过 DeepSeek 英文 ASR 纠错")
+    parser.add_argument("--asr-polish-batch-size", type=int, default=10)
+    parser.add_argument("--asr-polish-workers", type=int, default=3)
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_COSYVOICE_MODEL)
     parser.add_argument("--speaker", default="中文女")
     parser.add_argument("--cookies-from-browser", default="chrome")
@@ -745,6 +960,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-chars-per-sec", type=float, default=10.0)
     parser.add_argument("--max-duration-ratio", type=float, default=1.15)
     parser.add_argument("--tts-speed", type=float, default=1.0)
+    parser.add_argument("--tts-workers", type=int, default=2)
+    parser.add_argument("--tts-devices", default=os.environ.get("TTS_DEVICES", "0,1"))
     parser.add_argument("--no-fp16", action="store_true")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-tts", action="store_true")
@@ -782,6 +999,19 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"找不到英文字幕: {en_srt}")
         make_asr_srt(video_path, en_srt, args.whisper_model)
     en_subs = smooth_source_subtitles(list(srt.parse(en_srt.read_text(encoding="utf-8"))))
+    if not args.no_asr_polish:
+        en_subs = polish_source_subtitles(
+            en_subs,
+            out_dir / "asr_polish_cache.json",
+            deepseek_model=args.deepseek_model,
+            deepseek_key_file=args.deepseek_key_file,
+            deepseek_base_url=args.deepseek_base_url,
+            deepseek_reasoning_effort=args.deepseek_reasoning_effort,
+            batch_size=max(1, args.asr_polish_batch_size),
+            workers=max(1, args.asr_polish_workers),
+            force=args.force,
+        )
+        en_subs = smooth_source_subtitles(en_subs)
     en_srt.write_text(srt.compose(en_subs), encoding="utf-8")
 
     zh_srt = out_dir / f"{video_id}.zh-CN.srt"
@@ -797,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         deepseek_base_url=args.deepseek_base_url,
         deepseek_reasoning_effort=args.deepseek_reasoning_effort,
         batch_size=max(1, args.translation_batch_size),
+        workers=max(1, args.translation_workers),
     )
     zh_subs = smooth_subtitles(zh_subs, max_chars_per_sec=args.max_chars_per_sec)
     zh_srt.write_text(srt.compose(zh_subs), encoding="utf-8")
@@ -815,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
             max_duration_ratio=args.max_duration_ratio,
             fp16=not args.no_fp16,
             force=args.force,
+            tts_workers=max(1, args.tts_workers),
+            tts_devices=[device.strip() for device in args.tts_devices.split(",") if device.strip()],
         )
 
     glossary, glossary_digest = load_glossaries(args.glossary, local_glossary)
